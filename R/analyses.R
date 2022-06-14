@@ -1,82 +1,76 @@
-#stan_model
+# analyses
 library(rstan)
 library(ape)
 
-# loading data
-dat <- read.table("data/Temperature_resistance_data.csv", sep = ";", header = TRUE)
-spec_gform <- read.table("data/Growth_Forms_List.csv", sep = ";", header = TRUE)
-load(file = "data/analyses/r_tree.RData")
+# data_loading
+dat <- read.csv("data/Dataset_S1.csv")
+dat_sp <- read.csv("data/Dataset_S2.csv")
+dat_taxonstand <- read.csv("data/analyses/taxonstandNames.csv")
+phy <- read.tree("data/phy.tre")
 
-# data preparation
-dat$gform <- as.character(spec_gform$Growth_form[match(dat$Species, spec_gform$Species)])
+# data_preparation
+dat$Species <- with(dat_taxonstand, paste(New.Genus, New.Species)[match(dat$Species, Taxon)])
+dat_sp$Species <- with(dat_taxonstand, paste(New.Genus, New.Species)[match(dat_sp$Species, Taxon)])
   # exclusion of duplicated species from another year
-dat <- dat[!(dat$Species == "Gentiana_algida" & dat$Year == 2014), ]
-  # species names
-dat$Species[dat$Species == "Pedicularis_parryi_late_melt"] <- "Pedicularis_parryi2"
-pom_names <- unlist(lapply(strsplit(dat$Species, "_"), function(x) paste(x[1], x[2], sep = "_")))
-pom_names[grepl("\"", pom_names)] <- paste0(pom_names[grepl("\"", pom_names)], 2)
-pom_names <- gsub("\"", "", pom_names)
-old_spec <- c("Loricaria_antisanensis", "Oritrophium_peruvianum", "Oritrophium_hieracioides", "Lasiocephalus_ovatus", "Pentacalia_andicola")
-new_spec <- c("Gamochaeta_sp", "Diplostephium_sp", "Diplostephium_sp2", "Senecio_sp", "Senecio_sp2")
-pom_names[pom_names %in% old_spec] <- new_spec[match(pom_names[pom_names %in% old_spec], old_spec)]
-dat$Species <- pom_names
-
-  # selected species assesed in 4 periods
-  # species from 2 localities - randomly chosen one of the localities 
-sel_spec_pom <- colSums(table(dat$Period, dat$Species) > 0)
-sel_spec <- names(sel_spec_pom)[sel_spec_pom > 3]
-dat_cons <- dat[(dat$Species %in% sel_spec) & !(is.na(dat$Fr_lt50) & is.na(dat$He_lt50)), ]
-set.seed(10)
-for (i in unique(dat_cons$Species)){
-  loc <- sample(unique(dat_cons$Site[dat_cons$Species == i]), 1)
-  dat_cons <- dat_cons[dat_cons$Species != i | dat_cons$Site == loc, ]  
-}
+dat <- dat[!(dat$Species == "Gentiana algida" & dat$Year == 2014), ]
+  # species from 2 localities - preferentially taken from Brennkogel and Antisana
+aux <- rowSums(table(dat$Species, dat$Site) > 0)
+spec_dup <- names(aux[aux > 1])
+dat <- dat[(!dat$Species %in% spec_dup) | dat$Site %in% c("Brennkogel", "Antisana"), ]
+dat$Gform <- dat_sp$Growth_form[match(dat$Species, dat_sp$Species)]
+dato <- dat[dat$Species %in% names(table(dat$Species)[table(dat$Species) == 4]), ]
+# alternative analyses to check robustness of the results
+# 1) TTB for all species (including those without 4 obs.)
+#   dato <- dat
+# 2) TTB with different selection of localities for species from 2 loc.
+#   dat <- dat[(!dat$Species %in% spec_dup) | dat$Site %in% c("Yungeno", "Guamaní", "Niwot"), ]
+# 3) ad 2 + exclusion of species from "Brennkogel"
+#   dat <- dat[dat$Site != "Brennkogel", ]
 
 # data preparation_stan
-omax <- tapply(dat_cons$He_lt50, dat_cons$Species, max, na.rm = TRUE)
-omin <- tapply(dat_cons$Fr_lt50, dat_cons$Species, min, na.rm = TRUE)
-prep_resp <- function(resp_type, i = 1, dat_cons){
-  sp_list <- sort(unique(dat_cons$Species))
+omax <- tapply(dato$He_Lt_50, dato$Species, max, na.rm = TRUE)
+omin <- tapply(dato$Fr_Lt_50, dato$Species, min, na.rm = TRUE)
+prep_resp <- function(resp_type, i = 1, dat){
+  sp_list <- sort(unique(dat$Species))
   get_period <- function(svar, period){
-    sel <- dat_cons$Period == period
-    out <- dat_cons[, svar][sel][match(sp_list, dat_cons$Species[sel])]
+    sel <- dat$Season == period
+    out <- dat[, svar][sel][match(sp_list, dat$Species[sel])]
     names(out) <- sp_list
     out
   }
-  if (resp_type == "Fr") return(get_period("Fr_lt50", i + 1) - get_period("Fr_lt50", i))
-  if (resp_type == "He") return(get_period("He_lt50", i + 1) - get_period("He_lt50", i))
-  if (resp_type == "Ra") return(get_period("He_lt50", i) - get_period("Fr_lt50", i))
+  if (resp_type == "Fr") return(get_period("Fr_Lt_50", i + 1) - get_period("Fr_Lt_50", i))
+  if (resp_type == "He") return(get_period("He_Lt_50", i + 1) - get_period("He_Lt_50", i))
+  if (resp_type == "Ra") return(get_period("He_Lt_50", i) - get_period("Fr_Lt_50", i))
 }
-prep_dat <- function(resp, dat_cons, tree){
-  spec_aval <- !(resp == -Inf | resp == Inf | is.na(resp))
-  resp <- resp[spec_aval]
-  pres_spec <- tree[[2]][tree[[2]][, 1] %in% dat_cons$Species, ]
-  cons_r_tree <- drop.tip(tree[[1]], tree[[1]]$tip.label[!(tree[[1]]$tip.label %in% pres_spec[, 2])])
-  phy_pom <- vcv.phylo(cons_r_tree)
-  phy <- phy_pom[match(pres_spec[, 2], colnames(phy_pom))[order(pres_spec[, 1])], match(pres_spec[, 2], colnames(phy_pom))[order(pres_spec[, 1])]]
-  phy <- phy[spec_aval, spec_aval]
-  dat_cons$Trop <- as.numeric(dat_cons$Site %in% c("ANT", "GUA", "Yungeno"))
-  Trop <- tapply(dat_cons$Trop, dat_cons$Species, mean)[spec_aval]
-  GrowthF <- as.numeric(factor(tapply(dat_cons$gform, dat_cons$Species, unique)[spec_aval]))
-  Area <- as.numeric(factor(tapply(dat_cons$Site, dat_cons$Species, unique)[spec_aval]))
-  Nspec <- length(Area)
-  list(Nspec = Nspec, resp = resp, Trop = Trop, GrowthF = GrowthF, Area = Area, phy = phy)
+prep_dat <- function(resp, dat, phy){
+  phy$tip.label <- gsub("_", " ", phy$tip.label)
+  resp <- resp[!is.na(resp) & is.finite(resp)]
+  spec_sel <- names(resp)
+  phy_sel <- keep.tip(phy, spec_sel)
+  phy_aux <- vcv.phylo(phy_sel)
+  phy_vcv <- phy_aux[match(spec_sel, rownames(phy_aux)), match(spec_sel, colnames(phy_aux))]
+  dat$Trop <- as.numeric(dat$Site %in% c("Antisana", "Guamaní", "Yungeno"))
+  Trop <- tapply(dat$Trop, dat$Species, unique)[spec_sel]
+  GrowthF <- as.numeric(factor(tapply(dat$Gform, dat$Species, unique)[spec_sel]))
+  Site <- as.numeric(factor(tapply(dat$Site, dat$Species, unique)[spec_sel]))
+  Nspec <- length(resp)
+  list(Nspec = Nspec, resp = resp, Trop = Trop, GrowthF = GrowthF, Site = Site, phy = phy_vcv)
 }
   # dat_stan for each response
-dat_stan <- prep_dat(omax-omin, dat_cons, tree)
-dat_stan <- prep_dat(omax, dat_cons, tree)
-dat_stan <- prep_dat(omin, dat_cons, tree)
-dat_stan <- prep_dat(prep_resp("Fr", 1, dat_cons), dat_cons, tree)
-dat_stan <- prep_dat(prep_resp("Fr", 2, dat_cons), dat_cons, tree)
-dat_stan <- prep_dat(prep_resp("Fr", 3, dat_cons), dat_cons, tree)
-dat_stan <- prep_dat(prep_resp("He", 1, dat_cons), dat_cons, tree)
-dat_stan <- prep_dat(prep_resp("He", 2, dat_cons), dat_cons, tree)
-dat_stan <- prep_dat(prep_resp("He", 3, dat_cons), dat_cons, tree)
+dat_stan <- prep_dat(omax-omin, dato, phy)
+dat_stan <- prep_dat(omax, dato, phy)
+dat_stan <- prep_dat(omin, dato, phy)
+dat_stan <- prep_dat(prep_resp("Fr", 1, dat), dat, phy)
+dat_stan <- prep_dat(prep_resp("Fr", 2, dat), dat, phy)
+dat_stan <- prep_dat(prep_resp("Fr", 3, dat), dat, phy)
+dat_stan <- prep_dat(prep_resp("He", 1, dat), dat, phy)
+dat_stan <- prep_dat(prep_resp("He", 2, dat), dat, phy)
+dat_stan <- prep_dat(prep_resp("He", 3, dat), dat, phy)
   # 4 ranges
-dat_stan <- c(prep_dat(prep_resp("Ra", 1, dat_cons), dat_cons, tree),
-  prep_dat(prep_resp("Ra", 2, dat_cons), dat_cons, tree),
-  prep_dat(prep_resp("Ra", 3, dat_cons), dat_cons, tree),
-  prep_dat(prep_resp("Ra", 4, dat_cons), dat_cons, tree))
+dat_stan <- c(prep_dat(prep_resp("Ra", 1, dat), dat, phy),
+  prep_dat(prep_resp("Ra", 2, dat), dat, phy),
+  prep_dat(prep_resp("Ra", 3, dat), dat, phy),
+  prep_dat(prep_resp("Ra", 4, dat), dat, phy))
 names(dat_stan) <- paste0(names(dat_stan), rep(1:4, each = 6))
 
 # model fit
@@ -85,7 +79,23 @@ mod_fit <- stan(model_code = mod_code, data = dat_stan, control = list(adapt_del
   # differences in consequitive periods
 mod_FrHe_fit <- stan(model_code = mod_FrHe_code, data = dat_stan, control = list(adapt_delta = 0.99), iter = 4000, seed = 105)
   # 4 ranges
-mod_4ranges_fit <- stan(model_code = mod_4ranges_code, data = dat_stan_ranges, iter = 4000, seed = 105)
+mod_4ranges_fit <- stan(model_code = mod_4ranges_code, data = dat_stan, iter = 4000, seed = 105)
+
+print(mod_fit, pars ="phylo", include = F)
+# save(mod_fit, file = "data/analyses/orange.RData")
+# save(mod_fit, file = "data/analyses/omax.RData")
+# save(mod_fit, file = "data/analyses/omin.RData")
+# save(mod_FrHe_fit, file = "data/analyses/Fr1.RData")
+# save(mod_FrHe_fit, file = "data/analyses/Fr2.RData")
+# save(mod_FrHe_fit, file = "data/analyses/Fr3.RData")
+# save(mod_FrHe_fit, file = "data/analyses/He1.RData")
+# save(mod_FrHe_fit, file = "data/analyses/He2.RData")
+# save(mod_FrHe_fit, file = "data/analyses/He3.RData")
+# save(mod_4ranges_fit, file = "data/analyses/ranges4.RData")
+
+# save(mod_fit, file = "data/analyses/orange_var1.RData")
+# save(mod_fit, file = "data/analyses/orange_var2.RData")
+# save(mod_fit, file = "data/analyses/orange_var3.RData")
 
 # stan models
 mod_code <- "
@@ -94,7 +104,7 @@ data {
   vector[Nspec] resp;
   vector[Nspec] Trop;
   int GrowthF[Nspec];
-  int Area[Nspec];
+  int Site[Nspec];
   cov_matrix[Nspec] phy;
 }
 parameters {
@@ -103,8 +113,8 @@ parameters {
   vector[max(GrowthF)-1] B2;
   real<lower=0> Cpar;
   real<lower=0, upper=1> lambda;
-  real<lower=0> sigArea;
-  vector[max(Area)] randArea;
+  real<lower=0> sigSite;
+  vector[max(Site)] randSite;
 }
 transformed parameters{
   matrix[Nspec, Nspec] phylo;
@@ -117,13 +127,13 @@ model {
   B1 ~ cauchy(0,5);
   B2 ~ cauchy(0,5);
   Cpar ~ cauchy(0,5);
-  sigArea ~ cauchy(0,5);
+  sigSite ~ cauchy(0,5);
 
   for (i in 1:Nspec){
     if (GrowthF[i]>1){pomB2[i] = B2[GrowthF[i]-1];}else{pomB2[i]=0;} 
   }
-  randArea ~ normal(0, sigArea);
-  pommu = A + B1 * Trop + pomB2 + randArea[Area];
+  randSite ~ normal(0, sigSite);
+  pommu = A + B1 * Trop + pomB2 + randSite[Site];
   resp ~ multi_normal(pommu, phylo);
 }
 "
@@ -162,25 +172,25 @@ data {
   vector[Nspec1] resp1;
   vector[Nspec1] Trop1;
   int GrowthF1[Nspec1];
-  int Area1[Nspec1];
+  int Site1[Nspec1];
   cov_matrix[Nspec1] phy1;
   int Nspec2;
   vector[Nspec2] resp2;
   vector[Nspec2] Trop2;
   int GrowthF2[Nspec2];
-  int Area2[Nspec2];
+  int Site2[Nspec2];
   cov_matrix[Nspec2] phy2;
   int Nspec3;
   vector[Nspec3] resp3;
   vector[Nspec3] Trop3;
   int GrowthF3[Nspec3];
-  int Area3[Nspec3];
+  int Site3[Nspec3];
   cov_matrix[Nspec3] phy3;
   int Nspec4;
   vector[Nspec4] resp4;
   vector[Nspec4] Trop4;
   int GrowthF4[Nspec4];
-  int Area4[Nspec4];
+  int Site4[Nspec4];
   cov_matrix[Nspec4] phy4;
 }
 parameters {
@@ -201,8 +211,8 @@ parameters {
   real<lower=0, upper=1> lambda2;
   real<lower=0, upper=1> lambda3;
   real<lower=0, upper=1> lambda4;
-  real<lower=0> sigArea;
-  vector[max(Area1)] randArea;
+  real<lower=0> sigSite;
+  vector[max(Site1)] randSite;
 }
 model {
   vector[Nspec1] pommu1;
@@ -227,7 +237,7 @@ model {
   Cpar2 ~ cauchy(0,5);
   Cpar3 ~ cauchy(0,5);
   Cpar4 ~ cauchy(0,5);
-  sigArea ~ cauchy(0,5);
+  sigSite ~ cauchy(0,5);
 
   phylo1 = Cpar1*((phy1-diag_matrix(diagonal(phy1)))*lambda1 + diag_matrix(diagonal(phy1)));
   phylo2 = Cpar2*((phy2-diag_matrix(diagonal(phy2)))*lambda2 + diag_matrix(diagonal(phy2)));
@@ -246,16 +256,15 @@ model {
   for (i in 1:Nspec4){
     if (GrowthF4[i]>1){pomC4[i] = C[GrowthF4[i]-1];}else{pomC4[i]=0;} 
   }
-  randArea ~ normal(0, sigArea);
-  pommu1 = A1 + B1 * Trop1 + pomC1 + randArea[Area1];
-  pommu2 = A2 + B2 * Trop2 + pomC2 + randArea[Area2];
-  pommu3 = A3 + B3 * Trop3 + pomC3 + randArea[Area3];
-  pommu4 = A4 + B4 * Trop4 + pomC4 + randArea[Area4];
+  randSite ~ normal(0, sigSite);
+  pommu1 = A1 + B1 * Trop1 + pomC1 + randSite[Site1];
+  pommu2 = A2 + B2 * Trop2 + pomC2 + randSite[Site2];
+  pommu3 = A3 + B3 * Trop3 + pomC3 + randSite[Site3];
+  pommu4 = A4 + B4 * Trop4 + pomC4 + randSite[Site4];
   resp1 ~ multi_normal(pommu1, phylo1);
   resp2 ~ multi_normal(pommu2, phylo2);
   resp3 ~ multi_normal(pommu3, phylo3);
   resp4 ~ multi_normal(pommu4, phylo4);
 }
 "
-
 #_
